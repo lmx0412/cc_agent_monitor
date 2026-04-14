@@ -1,0 +1,12 @@
+{
+  "_comment": "Token pricing configuration for Agent Monitor cost display.",
+  "_comment2": "Default values use standard Anthropic claude-sonnet rates (USD per 1M tokens).",
+  "_comment3": "Adjust these values if you use a reseller or regional pricing.",
+  "currency": "USD",
+  "per_million_tokens": {
+    "input":          3.00,
+    "cache_creation": 3.75,
+    "cache_read":     0.30,
+    "output":        15.00
+  }
+}
