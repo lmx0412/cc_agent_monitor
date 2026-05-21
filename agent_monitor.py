@@ -16,13 +16,34 @@ Session 生命周期：
 """
 
 import json
+import os
+import fcntl
+import tempfile
 import argparse
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
 STATUS_FILE = Path.home() / ".claude" / "agent-status.json"
+LOCK_FILE = STATUS_FILE.with_suffix(".lock")
 
 MAX_HISTORY = 5
+
+
+@contextmanager
+def _file_lock():
+    """Cross-process exclusive lock around the status file.
+
+    Without this, concurrent hook invocations from multiple Claude sessions
+    race on read-modify-write and lose updates.
+    """
+    STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(LOCK_FILE, "w") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
 def _read() -> dict:
@@ -40,9 +61,22 @@ def _read() -> dict:
 
 def _write(data: dict):
     STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    tmp = STATUS_FILE.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(STATUS_FILE)
+    # Per-process temp file — concurrent writers must not share the same name,
+    # otherwise one process's replace() races with another's and fails with
+    # FileNotFoundError on the source.
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=".agent-status-", suffix=".tmp", dir=str(STATUS_FILE.parent)
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, STATUS_FILE)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def update_status(
@@ -60,42 +94,43 @@ def update_status(
     若 session 已在 history（已终止），忽略——不会把已退出的 session 重新激活。
     """
     now = datetime.now().isoformat(timespec="seconds")
-    data = _read()
-    active = data.get("active", [])
-    history = data.get("history", [])
+    with _file_lock():
+        data = _read()
+        active = data.get("active", [])
+        history = data.get("history", [])
 
-    # 已终止的 session 不再更新
-    if any(h["id"] == agent_id for h in history):
-        return
+        # 已终止的 session 不再更新
+        if any(h["id"] == agent_id for h in history):
+            return
 
-    existing = next((a for a in active if a["id"] == agent_id), None)
-    if existing:
-        existing["name"] = name
-        existing["status"] = status
-        if detail:          # idle 时 detail 传空，保留上一轮的内容
-            existing["detail"] = detail
-        existing["updated_at"] = now
-        if transcript_path:
-            existing["transcript_path"] = transcript_path
-        if project_dir:
-            existing["project_dir"] = project_dir
-    else:
-        active.append({
-            "id": agent_id,
-            "name": name,
-            "status": status,
-            "detail": detail,
-            "started_at": now,
-            "ended_at": None,
-            "updated_at": now,
-            "transcript_path": transcript_path,
-            "project_dir": project_dir,
-        })
+        existing = next((a for a in active if a["id"] == agent_id), None)
+        if existing:
+            existing["name"] = name
+            existing["status"] = status
+            if detail:          # idle 时 detail 传空，保留上一轮的内容
+                existing["detail"] = detail
+            existing["updated_at"] = now
+            if transcript_path:
+                existing["transcript_path"] = transcript_path
+            if project_dir:
+                existing["project_dir"] = project_dir
+        else:
+            active.append({
+                "id": agent_id,
+                "name": name,
+                "status": status,
+                "detail": detail,
+                "started_at": now,
+                "ended_at": None,
+                "updated_at": now,
+                "transcript_path": transcript_path,
+                "project_dir": project_dir,
+            })
 
-    data["active"] = active
-    data["history"] = history
-    data["updated_at"] = now
-    _write(data)
+        data["active"] = active
+        data["history"] = history
+        data["updated_at"] = now
+        _write(data)
 
 
 def end_session(
@@ -117,50 +152,51 @@ def end_session(
       "terminated"  → 直接标记 terminated
     """
     now = datetime.now().isoformat(timespec="seconds")
-    data = _read()
-    active = data.get("active", [])
-    history = data.get("history", [])
+    with _file_lock():
+        data = _read()
+        active = data.get("active", [])
+        history = data.get("history", [])
 
-    agent = next((a for a in active if a["id"] == agent_id), None)
+        agent = next((a for a in active if a["id"] == agent_id), None)
 
-    if agent is None:
-        # 不在 active：可能从未有过 PostToolUse（session 没有工具调用就退出）
-        # 检查是否已在 history，避免重复
-        if any(h["id"] == agent_id for h in history):
-            return
-        # 构造最小记录
-        final_status = _resolve_end_status(end_status, "running")
-        agent = {
-            "id": agent_id,
-            "name": name or agent_id[:8],
-            "status": final_status,
-            "detail": "",
-            "started_at": now,
-            "ended_at": now,
-            "updated_at": now,
-            "transcript_path": transcript_path,
-            "project_dir": project_dir,
-        }
-    else:
-        active = [a for a in active if a["id"] != agent_id]
-        agent = dict(agent)
-        if name:
-            agent["name"] = name
-        if transcript_path:
-            agent["transcript_path"] = transcript_path
-        if project_dir:
-            agent["project_dir"] = project_dir
-        agent["status"] = _resolve_end_status(end_status, agent.get("status", "running"))
-        agent["ended_at"] = now
-        agent["updated_at"] = now
+        if agent is None:
+            # 不在 active：可能从未有过 PostToolUse（session 没有工具调用就退出）
+            # 检查是否已在 history，避免重复
+            if any(h["id"] == agent_id for h in history):
+                return
+            # 构造最小记录
+            final_status = _resolve_end_status(end_status, "running")
+            agent = {
+                "id": agent_id,
+                "name": name or agent_id[:8],
+                "status": final_status,
+                "detail": "",
+                "started_at": now,
+                "ended_at": now,
+                "updated_at": now,
+                "transcript_path": transcript_path,
+                "project_dir": project_dir,
+            }
+        else:
+            active = [a for a in active if a["id"] != agent_id]
+            agent = dict(agent)
+            if name:
+                agent["name"] = name
+            if transcript_path:
+                agent["transcript_path"] = transcript_path
+            if project_dir:
+                agent["project_dir"] = project_dir
+            agent["status"] = _resolve_end_status(end_status, agent.get("status", "running"))
+            agent["ended_at"] = now
+            agent["updated_at"] = now
 
-    history = [agent] + [h for h in history if h["id"] != agent_id]
-    history = history[:MAX_HISTORY]
+        history = [agent] + [h for h in history if h["id"] != agent_id]
+        history = history[:MAX_HISTORY]
 
-    data["active"] = active
-    data["history"] = history
-    data["updated_at"] = now
-    _write(data)
+        data["active"] = active
+        data["history"] = history
+        data["updated_at"] = now
+        _write(data)
 
 
 def _resolve_end_status(end_status: str, current_status: str) -> str:
@@ -177,11 +213,12 @@ def _resolve_end_status(end_status: str, current_status: str) -> str:
 
 def clear_agent(agent_id: str):
     """从 active 和 history 中移除指定 session。"""
-    data = _read()
-    data["active"] = [a for a in data.get("active", []) if a["id"] != agent_id]
-    data["history"] = [a for a in data.get("history", []) if a["id"] != agent_id]
-    data["updated_at"] = datetime.now().isoformat(timespec="seconds")
-    _write(data)
+    with _file_lock():
+        data = _read()
+        data["active"] = [a for a in data.get("active", []) if a["id"] != agent_id]
+        data["history"] = [a for a in data.get("history", []) if a["id"] != agent_id]
+        data["updated_at"] = datetime.now().isoformat(timespec="seconds")
+        _write(data)
 
 
 if __name__ == "__main__":
